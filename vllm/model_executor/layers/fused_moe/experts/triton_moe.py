@@ -54,6 +54,8 @@ from vllm.utils.multi_stream_utils import maybe_execute_in_parallel
 class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
     """Triton-based fused MoE expert implementation."""
 
+    _verify_diag_index: int
+
     def __init__(
         self,
         moe_config: FusedMoEConfig,
@@ -534,6 +536,18 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
 
         # separate function is required for MoE + LoRA
         self.moe_sum(intermediate_cache3, output)
+
+        diag = getattr(self, "_verify_diag", None)
+        if diag is not None:
+            diag.moe(
+                layer_index=self._verify_diag_index,
+                topk_ids=topk_ids,
+                sorted_token_ids=sorted_token_ids,
+                num_tokens_post_padded=num_tokens_post_padded,
+                w1=w1,
+                w2=w2,
+                config=config,
+            )
 
     def moe_sum(self, input: torch.Tensor, output: torch.Tensor) -> None:
         ops.moe_sum(input, output)

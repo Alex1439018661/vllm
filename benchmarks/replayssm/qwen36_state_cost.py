@@ -12,6 +12,7 @@ from pathlib import Path
 
 import torch
 from qwen36_flush_crossover import Inputs, capture, save
+from replayssm_runtime.config import VLLM_ROOT
 
 from vllm.triton_utils import tl, triton
 
@@ -86,7 +87,7 @@ def benchmark(root):
                 text=True,
             ),
             source_head=subprocess.check_output(
-                ["git", "rev-parse", "HEAD"], text=True
+                ["git", "-C", str(VLLM_ROOT), "rev-parse", "HEAD"], text=True
             ).strip(),
             source_sha256=hashlib.sha256(source).hexdigest(),
             helper_sha256=hashlib.sha256(helper).hexdigest(),

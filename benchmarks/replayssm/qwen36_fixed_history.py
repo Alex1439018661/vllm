@@ -14,6 +14,7 @@ from pathlib import Path
 import torch
 from qwen36_flush_crossover import Inputs, Layer, capture, cursors, save, time_graph
 from qwen36_parallel_last import parallel_last
+from replayssm_runtime.config import VLLM_ROOT
 
 
 class FinalLayer(Layer):
@@ -151,7 +152,7 @@ def queue(args):
                     gpu=args.gpu,
                     sources=hashes,
                     source_head=subprocess.check_output(
-                        ["git", "rev-parse", "HEAD"], text=True
+                        ["git", "-C", str(VLLM_ROOT), "rev-parse", "HEAD"], text=True
                     ).strip(),
                 ),
             )

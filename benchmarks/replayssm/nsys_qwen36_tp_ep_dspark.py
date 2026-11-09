@@ -11,19 +11,16 @@ iteration: target verify and acceptance followed by the next DSpark proposal.
 import argparse
 import json
 
+from replayssm_runtime.config import resolve_arguments
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--model",
-        default="/data1/fanya/Qwen/Qwen3.6-35B-A3B",
     )
     parser.add_argument(
         "--draft-model",
-        default=(
-            "/home/fanya/data1/fanya/models/"
-            "Qwen3.6-35B-A3B-speculator.dspark"
-        ),
     )
     parser.add_argument("--tensor-parallel-size", type=int, default=2)
     parser.add_argument("--buffer-len", type=int, default=16)
@@ -31,7 +28,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-model-len", type=int, default=2048)
     parser.add_argument("--max-tokens", type=int, default=32)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.85)
-    return parser.parse_args()
+    args = parser.parse_args()
+    return resolve_arguments(
+        parser,
+        args,
+        models=(("model", "qwen36"), ("draft_model", "qwen36_dspark")),
+    )
 
 
 def _counter(metrics, name: str) -> float:
@@ -90,9 +92,7 @@ def main() -> None:
         seed=0,
     )
 
-    warmup_messages = [
-        [{"role": "user", "content": "What is 19 multiplied by 23?"}]
-    ]
+    warmup_messages = [[{"role": "user", "content": "What is 19 multiplied by 23?"}]]
     profile_messages = [
         [
             {
@@ -111,15 +111,11 @@ def main() -> None:
         chat_template_kwargs={"enable_thinking": False},
         use_tqdm=False,
     )
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
 
     metrics_before = llm.get_metrics()
-    drafts_before = _counter(
-        metrics_before, "vllm:spec_decode_num_drafts"
-    )
-    accepted_before = _counter(
-        metrics_before, "vllm:spec_decode_num_accepted_tokens"
-    )
+    drafts_before = _counter(metrics_before, "vllm:spec_decode_num_drafts")
+    accepted_before = _counter(metrics_before, "vllm:spec_decode_num_accepted_tokens")
     llm.start_profile("qwen36_tp2_ep2_replayssm_dspark")
     outputs = llm.chat(
         profile_messages,
@@ -128,15 +124,14 @@ def main() -> None:
         use_tqdm=False,
     )
     llm.stop_profile()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
 
     metrics_after = llm.get_metrics()
-    drafts = _counter(
-        metrics_after, "vllm:spec_decode_num_drafts"
-    ) - drafts_before
-    accepted = _counter(
-        metrics_after, "vllm:spec_decode_num_accepted_tokens"
-    ) - accepted_before
+    drafts = _counter(metrics_after, "vllm:spec_decode_num_drafts") - drafts_before
+    accepted = (
+        _counter(metrics_after, "vllm:spec_decode_num_accepted_tokens")
+        - accepted_before
+    )
     result = {
         "model": args.model,
         "draft_model": args.draft_model,

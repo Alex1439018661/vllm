@@ -61,6 +61,13 @@ from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
+from vllm.verify_diagnostics import (
+    close_scheduler_log,
+    scheduler_log,
+)
+from vllm.verify_diagnostics import (
+    enabled as verify_diag_enabled,
+)
 
 logger = init_logger(__name__)
 
@@ -324,8 +331,7 @@ class Scheduler(SchedulerInterface):
         if routed_experts_trace_config is not None:
             if not self.enable_return_routed_experts:
                 raise ValueError(
-                    "routed_experts_trace requires "
-                    "enable_return_routed_experts=True"
+                    "routed_experts_trace requires enable_return_routed_experts=True"
                 )
             if not isinstance(routed_experts_trace_config, dict):
                 raise ValueError("routed_experts_trace must be a dictionary")
@@ -1153,6 +1159,34 @@ class Scheduler(SchedulerInterface):
         if self.defer_block_free and total_num_scheduled_tokens > 0:
             self.sched_step_seq += 1
 
+        if verify_diag_enabled():
+            scheduler_output.verify_diag_id = self.current_step
+            scheduler_output.verify_diag_requests = {}
+
+            for req_id, scheduled in num_scheduled_tokens.items():
+                request = self.requests[req_id]
+                scheduler_output.verify_diag_requests[req_id] = {
+                    "prompt_tokens": int(request.num_prompt_tokens),
+                    "confirmed_output_tokens": int(request.num_output_tokens),
+                    "confirmed_context_tokens": int(request.num_tokens),
+                    # With async scheduling this value can be optimistic.
+                    "computed_tokens_at_schedule": int(request.num_computed_tokens),
+                    "output_placeholders": int(request.num_output_placeholders),
+                    "scheduled_tokens": int(scheduled),
+                    "scheduled_drafts": len(
+                        scheduled_spec_decode_tokens.get(req_id, [])
+                    ),
+                    "is_decode": int(
+                        request.num_computed_tokens >= request.num_prompt_tokens
+                    ),
+                }
+
+            scheduler_log(
+                "schedule",
+                step_id=self.current_step,
+                requests=scheduler_output.verify_diag_requests,
+            )
+
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
         return scheduler_output
@@ -1652,6 +1686,7 @@ class Scheduler(SchedulerInterface):
             kv_transfer_params = None
             status_before_stop = request.status
             num_output_tokens_before = len(request._output_token_ids)
+            diag_sampled_count = len(generated_token_ids)
 
             # Check for stop and update request status.
             if new_token_ids:
@@ -1662,6 +1697,23 @@ class Scheduler(SchedulerInterface):
                 # Pooling stops as soon as there is output.
                 request.status = RequestStatus.FINISHED_STOPPED
                 stopped = True
+
+            if verify_diag_enabled():
+                scheduler_log(
+                    "request_output",
+                    step_id=scheduler_output.verify_diag_id,
+                    request_id=req_id,
+                    sampled_output_count=diag_sampled_count,
+                    submitted_drafts=len(
+                        scheduler_output.scheduled_spec_decode_tokens.get(req_id, [])
+                    ),
+                    confirmed_output_tokens_before=num_output_tokens_before,
+                    confirmed_output_tokens_after=int(request.num_output_tokens),
+                    committed_output_count=(
+                        int(request.num_output_tokens) - num_output_tokens_before
+                    ),
+                    stopped=bool(stopped),
+                )
 
             if new_token_ids and self.structured_output_manager.should_advance(request):
                 struct_output_request = request.structured_output_request
@@ -2351,6 +2403,7 @@ class Scheduler(SchedulerInterface):
 
     def shutdown(self) -> None:
         logger.debug_once("[shutdown] Scheduler: start")
+        close_scheduler_log()
         if self.routed_experts_trace_writer is not None:
             self.routed_experts_trace_writer.close()
         if self.kv_event_publisher:

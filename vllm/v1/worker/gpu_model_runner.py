@@ -4,6 +4,7 @@
 import functools
 import gc
 import itertools
+import os
 import threading
 import time
 from collections import defaultdict
@@ -216,6 +217,15 @@ from vllm.v1.worker.ubatch_utils import (
 )
 from vllm.v1.worker.utils import is_residual_scattered_for_sp
 from vllm.v1.worker.workspace import lock_workspace
+from vllm.verify_diagnostics import (
+    VerifyDiagnostics,
+)
+from vllm.verify_diagnostics import (
+    enabled as verify_diag_enabled,
+)
+from vllm.verify_diagnostics import (
+    region as verify_diag_region,
+)
 
 from .utils import (
     AttentionGroup,
@@ -923,6 +933,8 @@ class GPUModelRunner(
                 self.max_num_reqs, dtype=torch.int32
             )
         self.layerwise_nvtx_hooks_registered = False
+
+        self.verify_diag: VerifyDiagnostics | None = None
 
     def update_max_model_len(self, max_model_len: int) -> None:
         self.max_model_len = max_model_len
@@ -4077,6 +4089,9 @@ class GPUModelRunner(
                 "after execute_model() returns None."
             )
 
+        if self.verify_diag is not None:
+            self.verify_diag.begin(scheduler_output)
+
         if self.routed_experts_initialized:
             self.routed_experts_capturer.clear_buffer()
 
@@ -4104,6 +4119,7 @@ class GPUModelRunner(
 
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         with (
+            verify_diag_region(self.verify_diag, "prepare"),
             record_function_or_nullcontext("gpu_model_runner: preprocess"),
             self.synchronize_input_prep(),
         ):
@@ -4225,7 +4241,8 @@ class GPUModelRunner(
                 # to decide copy operations, so we must apply deferred
                 # corrections before it runs.
                 if deferred_state_corrections_fn:
-                    deferred_state_corrections_fn()
+                    with verify_diag_region(self.verify_diag, "state_correction"):
+                        deferred_state_corrections_fn()
                     deferred_state_corrections_fn = None
                 mamba_bufs = self._get_mamba_bufs()
                 mamba_utils.preprocess_mamba(
@@ -4319,6 +4336,15 @@ class GPUModelRunner(
             self.model_config.is_encoder_decoder and num_encoder_reqs > 0
         )
 
+        if self.verify_diag is not None:
+            self.verify_diag.inputs(
+                scheduler_output=scheduler_output,
+                num_tokens_padded=num_tokens_padded,
+                cudagraph_mode=cudagraph_mode,
+                spec_decode_metadata=spec_decode_metadata,
+                attn_metadata=attn_metadata,
+            )
+
         # Run the model.
         # Use persistent buffers for CUDA graphs.
         # When spec decode is enabled, defer connector finalization
@@ -4348,6 +4374,7 @@ class GPUModelRunner(
                 scheduler_output,
                 defer_finalize=defer_kv_connector_finalize,
             ) as kv_connector_output,
+            verify_diag_region(self.verify_diag, "forward"),
         ):
             model_output = self._model_forward(
                 input_ids=input_ids,
@@ -4357,7 +4384,10 @@ class GPUModelRunner(
                 **model_kwargs,
             )
 
-        with record_function_or_nullcontext("gpu_model_runner: postprocess"):
+        with (
+            verify_diag_region(self.verify_diag, "logits"),
+            record_function_or_nullcontext("gpu_model_runner: postprocess"),
+        ):
             if self.use_aux_hidden_state_outputs:
                 # True when EAGLE 3 is used.
                 hidden_states, aux_hidden_states = model_output
@@ -4432,7 +4462,8 @@ class GPUModelRunner(
         # Now the batch has been launched we can wait for corrections from the
         # previous model forward without breaking async scheduling.
         if deferred_state_corrections_fn:
-            deferred_state_corrections_fn()
+            with verify_diag_region(self.verify_diag, "state_correction"):
+                deferred_state_corrections_fn()
 
         return None
 
@@ -4487,12 +4518,19 @@ class GPUModelRunner(
                 scheduler_output, grammar_output, self.input_batch, logits
             )
 
-        with record_function_or_nullcontext("gpu_model_runner: sample"):
+        with (
+            verify_diag_region(self.verify_diag, "acceptance"),
+            record_function_or_nullcontext("gpu_model_runner: sample"),
+        ):
             sampler_output = self._sample(logits, spec_decode_metadata)
 
-        self._update_states_after_model_execute(
-            sampler_output.sampled_token_ids, scheduler_output
-        )
+        if self.verify_diag is not None:
+            self.verify_diag.sampled(sampler_output.sampled_token_ids)
+
+        with verify_diag_region(self.verify_diag, "state_postprocess"):
+            self._update_states_after_model_execute(
+                sampler_output.sampled_token_ids, scheduler_output
+            )
         if self.use_async_scheduling:
             pp = get_pp_group()
             # For torchrun external_launcher PP mode with broadcast_pp_output=True,
@@ -4512,7 +4550,10 @@ class GPUModelRunner(
 
         def propose_draft_token_ids(sampled_token_ids):
             assert spec_decode_common_attn_metadata is not None
-            with record_function_or_nullcontext("gpu_model_runner: draft"):
+            with (
+                verify_diag_region(self.verify_diag, "draft"),
+                record_function_or_nullcontext("gpu_model_runner: draft"),
+            ):
                 self._draft_token_ids = self.propose_draft_token_ids(
                     scheduler_output,
                     sampled_token_ids,
@@ -4603,7 +4644,10 @@ class GPUModelRunner(
                 self._draft_prob_req_ids = None
                 self._copy_draft_token_ids_to_cpu(scheduler_output, zeros_only=True)
 
-        with record_function_or_nullcontext("gpu_model_runner: bookkeep"):
+        with (
+            verify_diag_region(self.verify_diag, "bookkeep"),
+            record_function_or_nullcontext("gpu_model_runner: bookkeep"),
+        ):
             (
                 num_nans_in_logits,
                 logprobs_lists,
@@ -4637,6 +4681,9 @@ class GPUModelRunner(
         # self.kv_connector_output may be modified during drafting
         kv_connector_output = self.kv_connector_output
         self.kv_connector_output = None
+
+        if self.verify_diag is not None:
+            self.verify_diag.finish()
 
         with record_function_or_nullcontext("gpu_model_runner: ModelRunnerOutput"):
             output = ModelRunnerOutput(
@@ -4850,7 +4897,8 @@ class GPUModelRunner(
 
         counts_cpu = self.valid_sampled_token_count_cpu
         assert counts_cpu is not None
-        sampled_count_event.synchronize()
+        with verify_diag_region(self.verify_diag, "accepted_count_cpu_wait"):
+            sampled_count_event.synchronize()
         return counts_cpu[: prev_sampled_token_ids.shape[0]].tolist()
 
     def _get_spec_decode_draft_probs(
@@ -5304,6 +5352,21 @@ class GPUModelRunner(
             and self.eplb_state.is_async
         ):
             self.eplb_state.start_async_loop()
+
+        if verify_diag_enabled():
+            if self.compilation_config.mode == CompilationMode.STOCK_TORCH_COMPILE:
+                raise RuntimeError(
+                    "This diagnostic patch supports the current vLLM "
+                    "compilation path, not STOCK_TORCH_COMPILE."
+                )
+            if os.environ.get("REPLAYSSM_DECODE_SUITE"):
+                from decode_benchmark.benchmark.instrumentation import (
+                    create_diagnostics,
+                )
+
+                self.verify_diag = create_diagnostics(self)
+            else:
+                self.verify_diag = VerifyDiagnostics(self)
 
         if (
             self.vllm_config.compilation_config.mode
@@ -7487,9 +7550,10 @@ class GPUModelRunner(
 
         bound_modules = 0
         skipped_draft_modules = 0
-        for module_name, module in (
-            self.compilation_config.static_forward_context.items()
-        ):
+        for (
+            module_name,
+            module,
+        ) in self.compilation_config.static_forward_context.items():
             # MTP runs before routed-expert D2H and can share layer IDs with
             # the target model. Binding it would overwrite target routes.
             if not is_target_model_moe_module(module_name):

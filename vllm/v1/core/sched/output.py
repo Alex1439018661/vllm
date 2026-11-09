@@ -244,6 +244,10 @@ class SchedulerOutput:
     # Number of spec tokens to schedule for the next step.
     num_spec_tokens_to_schedule: int = 0
 
+    # Diagnostic metadata only; does not affect scheduling.
+    verify_diag_id: int = -1
+    verify_diag_requests: dict[str, dict[str, int]] | None = None
+
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":
         return cls(

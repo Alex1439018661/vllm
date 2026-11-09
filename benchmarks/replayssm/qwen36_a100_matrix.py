@@ -11,6 +11,8 @@ import sys
 import time
 from pathlib import Path
 
+from replayssm_runtime.config import resolve_arguments
+
 
 def write_json(path, value):
     path = Path(path)
@@ -262,10 +264,8 @@ def worker(args):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model", default="/data1/fanya/Qwen/Qwen3.6-35B-A3B")
-    parser.add_argument(
-        "--dataset", default="/home/fanya/replayssm_build_artifacts/gsm8k_test.jsonl"
-    )
+    parser.add_argument("--model")
+    parser.add_argument("--dataset")
     parser.add_argument("--output", required=True)
     parser.add_argument("--gpu", type=int, default=0)
     parser.add_argument("--batches", default="1,4")
@@ -278,6 +278,12 @@ def main():
     parser.add_argument("--draft", type=int, default=0)
     parser.add_argument("--mode", choices=["ar", "standard", "replayssm"])
     args = parser.parse_args()
+    resolve_arguments(
+        parser,
+        args,
+        models=(("model", "qwen36"),),
+        datasets=(("dataset", "gsm8k"),),
+    )
     if args.worker:
         worker(args)
         return

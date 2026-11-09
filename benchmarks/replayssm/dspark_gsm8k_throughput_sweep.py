@@ -13,6 +13,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+from replayssm_runtime.config import VLLM_ROOT, resolve_arguments, results_dir
 
 DEFAULT_BATCH_SIZES = (32, 64, 128, 256)
 DEFAULT_DRAFT_LENGTHS = (2, 3, 4, 5)
@@ -36,10 +37,10 @@ def parse_gpu_list(value: str) -> tuple[int, ...]:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model", required=True)
-    parser.add_argument("--spec-model", required=True)
-    parser.add_argument("--dataset-path", required=True)
-    parser.add_argument("--output-root", required=True)
+    parser.add_argument("--model")
+    parser.add_argument("--spec-model")
+    parser.add_argument("--dataset-path")
+    parser.add_argument("--output-root")
     parser.add_argument(
         "--batch-sizes",
         type=parse_int_list,
@@ -59,7 +60,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--draft-length", type=int, help=argparse.SUPPRESS)
     parser.add_argument("--physical-gpu", type=int, help=argparse.SUPPRESS)
     parser.add_argument("--cell-dir", help=argparse.SUPPRESS)
-    return parser.parse_args()
+    args = parser.parse_args()
+    resolve_arguments(
+        parser,
+        args,
+        models=(("model", "qwen36"), ("spec_model", "qwen36_dspark")),
+        datasets=(("dataset_path", "gsm8k"),),
+    )
+    if args.output_root is None:
+        args.output_root = str(
+            results_dir() / f"dspark_sweep_{datetime.now(timezone.utc):%Y%m%d_%H%M%S}"
+        )
+    return args
 
 
 def utc_now() -> str:
@@ -82,10 +94,7 @@ def load_questions(dataset_path: str, count: int) -> list[list[dict[str, str]]]:
         raise ValueError(
             f"GSM8K has {len(questions)} rows, fewer than requested {count}"
         )
-    return [
-        [{"role": "user", "content": question}]
-        for question in questions[:count]
-    ]
+    return [[{"role": "user", "content": question}] for question in questions[:count]]
 
 
 def sum_counter(metrics: list[object], name: str) -> float:
@@ -99,10 +108,7 @@ def sum_counter(metrics: list[object], name: str) -> float:
 def capture_sizes(batch_size: int, verify_width: int) -> list[int]:
     request_sizes = (1, 2, 4, 8, 16, 24, 32, 48, 64)
     return sorted(
-        {
-            min(request_size, batch_size) * verify_width
-            for request_size in request_sizes
-        }
+        {min(request_size, batch_size) * verify_width for request_size in request_sizes}
     )
 
 
@@ -164,7 +170,7 @@ def run_worker(args: argparse.Namespace) -> None:
     )
     chat_kwargs = {"enable_thinking": False}
 
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     warmup_start = time.perf_counter()
     warmup_outputs = llm.chat(
         messages[:1],
@@ -172,11 +178,9 @@ def run_worker(args: argparse.Namespace) -> None:
         chat_template_kwargs=chat_kwargs,
         use_tqdm=False,
     )
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     warmup_elapsed = time.perf_counter() - warmup_start
-    warmup_tokens = sum(
-        len(output.outputs[0].token_ids) for output in warmup_outputs
-    )
+    warmup_tokens = sum(len(output.outputs[0].token_ids) for output in warmup_outputs)
     if len(warmup_outputs) != 1 or warmup_tokens != args.max_tokens:
         raise AssertionError(
             "single-sample warmup did not produce the requested token count"
@@ -188,7 +192,7 @@ def run_worker(args: argparse.Namespace) -> None:
     )
     drafts_before = sum_counter(metrics_before, "vllm:spec_decode_num_drafts")
 
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     formal_start = time.perf_counter()
     outputs = llm.chat(
         messages,
@@ -196,7 +200,7 @@ def run_worker(args: argparse.Namespace) -> None:
         chat_template_kwargs=chat_kwargs,
         use_tqdm=False,
     )
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     formal_elapsed = time.perf_counter() - formal_start
 
     output_lengths = [len(output.outputs[0].token_ids) for output in outputs]
@@ -214,10 +218,7 @@ def run_worker(args: argparse.Namespace) -> None:
         sum_counter(metrics_after, "vllm:spec_decode_num_accepted_tokens")
         - accepted_before
     )
-    drafts = (
-        sum_counter(metrics_after, "vllm:spec_decode_num_drafts")
-        - drafts_before
-    )
+    drafts = sum_counter(metrics_after, "vllm:spec_decode_num_drafts") - drafts_before
     result = {
         "status": "complete",
         "started_at": started_at,
@@ -333,7 +334,7 @@ def launch_cell(
     child_env["HF_HUB_OFFLINE"] = "1"
     child_env["HF_DATASETS_OFFLINE"] = "1"
     child_env["HF_HUB_DISABLE_TELEMETRY"] = "1"
-    python_bin = str(Path(sys.executable).resolve().parent)
+    python_bin = str(Path(sys.executable).absolute().parent)
     child_env["PATH"] = os.pathsep.join(
         value for value in (python_bin, child_env.get("PATH")) if value
     )
@@ -362,9 +363,7 @@ def collect_results(
     for batch_size in batch_sizes:
         for draft_length in draft_lengths:
             cell_dir = output_root / "cells" / cell_name(batch_size, draft_length)
-            if not result_is_complete(
-                cell_dir, batch_size, draft_length, max_tokens
-            ):
+            if not result_is_complete(cell_dir, batch_size, draft_length, max_tokens):
                 raise RuntimeError(f"incomplete or invalid cell: {cell_dir}")
             results.append(json.loads((cell_dir / "result.json").read_text()))
     return results
@@ -398,19 +397,12 @@ def plot_results(output_root: Path, results: list[dict[str, object]]) -> None:
     batches = sorted({int(result["batch_size"]) for result in results})
     for batch_size in batches:
         batch_results = sorted(
-            (
-                result
-                for result in results
-                if int(result["batch_size"]) == batch_size
-            ),
+            (result for result in results if int(result["batch_size"]) == batch_size),
             key=lambda result: int(result["draft_length"]),
         )
         axis.plot(
             [int(result["draft_length"]) for result in batch_results],
-            [
-                float(result["completion_throughput_tok_s"])
-                for result in batch_results
-            ],
+            [float(result["completion_throughput_tok_s"]) for result in batch_results],
             marker="o",
             linewidth=2,
             label=f"Batch {batch_size}",
@@ -437,9 +429,9 @@ def run_sweep(args: argparse.Namespace) -> None:
     manifest = {
         "status": "running",
         "created_at": utc_now(),
-        "repo": str(Path.cwd()),
+        "repo": str(VLLM_ROOT),
         "git_head": subprocess.check_output(
-            ["git", "rev-parse", "HEAD"], text=True
+            ["git", "-C", str(VLLM_ROOT), "rev-parse", "HEAD"], text=True
         ).strip(),
         "model": str(Path(args.model).resolve()),
         "spec_model": str(Path(args.spec_model).resolve()),
@@ -475,9 +467,7 @@ def run_sweep(args: argparse.Namespace) -> None:
             if gpu in active or not pending:
                 continue
             batch_size, draft_length = pending.pop(0)
-            cell_dir = output_root / "cells" / cell_name(
-                batch_size, draft_length
-            )
+            cell_dir = output_root / "cells" / cell_name(batch_size, draft_length)
             process, log_file = launch_cell(
                 args, batch_size, draft_length, gpu, cell_dir
             )
@@ -528,8 +518,7 @@ def run_sweep(args: argparse.Namespace) -> None:
             result["warmup_sample_count"] == 1 for result in results
         ),
         "all_formal_sample_counts_match_batch": all(
-            result["formal_sample_count"] == result["batch_size"]
-            for result in results
+            result["formal_sample_count"] == result["batch_size"] for result in results
         ),
         "figure_png": str(output_root / "throughput_by_draft_length.png"),
         "summary_csv": str(output_root / "summary.csv"),

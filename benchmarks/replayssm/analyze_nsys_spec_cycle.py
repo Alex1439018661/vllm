@@ -7,11 +7,14 @@ import csv
 import hashlib
 import io
 import json
+import shlex
 import sqlite3
 import subprocess
+import sys
 from collections import defaultdict
 from pathlib import Path
 
+from replayssm_runtime.config import VLLM_ROOT, resolve_arguments
 
 STAGE_ORDER = (
     "target: prepare_inputs_h2d",
@@ -33,9 +36,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument(
         "--nsys",
-        default="/usr/local/cuda-12.9/bin/nsys",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    return resolve_arguments(parser, args, tools=(("nsys", "nsys"),))
 
 
 def _nsys_csv(nsys: str, report: str, sqlite_path: Path) -> list[dict]:
@@ -189,9 +192,7 @@ def main() -> None:
     )
 
     kernel_rows = []
-    kernel_stage_totals: dict[tuple[int, str], list[int]] = defaultdict(
-        lambda: [0, 0]
-    )
+    kernel_stage_totals: dict[tuple[int, str], list[int]] = defaultdict(lambda: [0, 0])
     kernel_query = """
         SELECT k.deviceId, s.value, k.start, k.end
         FROM CUPTI_ACTIVITY_KIND_KERNEL AS k
@@ -236,9 +237,7 @@ def main() -> None:
         }
         for (device, stage), values in kernel_stage_totals.items()
     ]
-    kernel_stage_rows.sort(
-        key=lambda row: (row["device"], row["stage"])
-    )
+    kernel_stage_rows.sort(key=lambda row: (row["device"], row["stage"]))
     _write_csv(
         args.output_dir / "kernel_by_stage.csv",
         kernel_stage_rows,
@@ -246,9 +245,7 @@ def main() -> None:
     )
 
     memcpy_events = []
-    memcpy_totals: dict[tuple[int, str], list[int]] = defaultdict(
-        lambda: [0, 0, 0]
-    )
+    memcpy_totals: dict[tuple[int, str], list[int]] = defaultdict(lambda: [0, 0, 0])
     memcpy_query = """
         SELECT m.deviceId, e.label, m.start, m.end, m.bytes,
                m.srcDeviceId, m.dstDeviceId
@@ -256,8 +253,8 @@ def main() -> None:
         JOIN ENUM_CUDA_MEMCPY_OPER AS e ON e.id = m.copyKind
         ORDER BY m.start
     """
-    for device, kind, start, end, size, src_device, dst_device in (
-        connection.execute(memcpy_query)
+    for device, kind, start, end, size, src_device, dst_device in connection.execute(
+        memcpy_query
     ):
         stage = _stage_for_timestamp(internal_stages, device, start)
         duration = end - start
@@ -301,9 +298,7 @@ def main() -> None:
         list(memcpy_summary[0]),
     )
 
-    stage_lookup = {
-        (row["device"], row["stage"]): row for row in stage_rows
-    }
+    stage_lookup = {(row["device"], row["stage"]): row for row in stage_rows}
     verify_start_skew_us = round(
         abs(
             stage_lookup[(0, "target: verify_forward")]["gpu_start_ms"]
@@ -313,26 +308,23 @@ def main() -> None:
         3,
     )
     allreduce_rows = [
-        row
-        for row in kernel_rows
-        if row["category"] == "tp_custom_allreduce"
+        row for row in kernel_rows if row["category"] == "tp_custom_allreduce"
     ]
     cycle_start = min(row["gpu_start_ms"] for row in stage_rows)
     cycle_end = max(
-        row["gpu_start_ms"] + row["gpu_duration_us"] / 1_000
-        for row in stage_rows
+        row["gpu_start_ms"] + row["gpu_duration_us"] / 1_000 for row in stage_rows
     )
     report_path = args.sqlite.with_suffix(".nsys-rep")
-    artifact_root = (
-        "/home/fanya/replayssm_build_artifacts/"
-        "nsys_qwen36_tp2_ep2_replayssm_dspark_20260828"
-    )
-    capture_command = f"""NSYS_OUTPUT={artifact_root}/qwen36_cycle
+    artifact_root = args.output_dir.expanduser().resolve()
+    capture_script = VLLM_ROOT / "benchmarks/replayssm/nsys_qwen36_tp_ep_dspark.py"
+    python_path = shlex.quote(str(Path(sys.executable).absolute().parent))
+    capture_command = f"""# Local reproduction example; historical metadata is separate.
+NSYS_OUTPUT={shlex.quote(str(artifact_root / "qwen36_cycle"))}
 CUDA_VISIBLE_DEVICES=0,1 \\
-PATH=.venv/bin:$PATH \\
+PATH={python_path}:$PATH \\
 VLLM_WORKER_MULTIPROC_METHOD=spawn \\
 VLLM_NVTX_SCOPES_FOR_PROFILING=1 \\
-/usr/local/cuda-12.9/bin/nsys profile \\
+{shlex.quote(args.nsys)} profile \\
   --output="$NSYS_OUTPUT" \\
   --force-overwrite=true \\
   --capture-range=cudaProfilerApi \\
@@ -345,16 +337,16 @@ VLLM_NVTX_SCOPES_FOR_PROFILING=1 \\
   --cuda-graph-trace=node \\
   --cuda-event-trace=true \\
   --stats=true \\
-  .venv/bin/python \\
-  benchmarks/replayssm/nsys_qwen36_tp_ep_dspark.py
+  {shlex.quote(sys.executable)} \\
+  {shlex.quote(str(capture_script))}
 """
-    (args.output_dir / "capture_command.txt").write_text(capture_command)
+    (args.output_dir / "reproduction_command.txt").write_text(capture_command)
     capture_manifest = {
         "captured_at_utc": "2026-08-28",
         "source_commit_at_capture": "991558dc2e5c",
         "branch_at_capture": "exp/replayssm-official-qwen36-tp2-ep2",
         "nsys_version": "2025.1.3.140",
-        "capture_command_file": "capture_command.txt",
+        "reproduction_command_file": "reproduction_command.txt",
         "worker_rank_map": {
             "2305329": "tp0_ep0_gpu0",
             "2305330": "tp1_ep1_gpu1",
@@ -383,9 +375,7 @@ VLLM_NVTX_SCOPES_FOR_PROFILING=1 \\
         "trace": {
             "nsys_rep": str(report_path),
             "sqlite": str(args.sqlite),
-            "capture_manifest": str(
-                args.output_dir / "capture_manifest.json"
-            ),
+            "capture_manifest": str(args.output_dir / "capture_manifest.json"),
         },
         "configuration": {
             "model": "Qwen3.6-35B-A3B",
@@ -404,21 +394,28 @@ VLLM_NVTX_SCOPES_FOR_PROFILING=1 \\
             "gpu_projected_span_ms": round(cycle_end - cycle_start, 6),
             "verify_start_skew_us": verify_start_skew_us,
             "tp_custom_allreduce_max_us_by_device": {
-                str(row["device"]): row["maximum_us"]
-                for row in allreduce_rows
+                str(row["device"]): row["maximum_us"] for row in allreduce_rows
             },
         },
         "memcpy_totals": memcpy_summary,
         "limitations": [
-            "CUDA Graph node tracing and CPU/Python tracing add overhead; "
-            "projected durations are diagnostic, not production latency.",
-            "GPU hardware/PCIe metrics were unavailable due GPU counter "
-            "permissions (ERR_NVGPUCTRPERM).",
-            "CUDA MemOps show direct H2D/D2H/D2D/P2P copies. NCCL and custom "
-            "collectives traverse the physical SYS path but are not direct "
-            "P2P memcpy rows or measured PCIe Tx/Rx counters.",
-            "NVTX host ranges measure host enqueue/control span, not CPU busy "
-            "time alone.",
+            (
+                "CUDA Graph node tracing and CPU/Python tracing add overhead; "
+                "projected durations are diagnostic, not production latency."
+            ),
+            (
+                "GPU hardware/PCIe metrics were unavailable due GPU counter "
+                "permissions (ERR_NVGPUCTRPERM)."
+            ),
+            (
+                "CUDA MemOps show direct H2D/D2H/D2D/P2P copies. NCCL and custom "
+                "collectives traverse the physical SYS path but are not direct "
+                "P2P memcpy rows or measured PCIe Tx/Rx counters."
+            ),
+            (
+                "NVTX host ranges measure host enqueue/control span, not CPU busy "
+                "time alone."
+            ),
         ],
     }
     (args.output_dir / "analysis_summary.json").write_text(
@@ -435,8 +432,7 @@ VLLM_NVTX_SCOPES_FOR_PROFILING=1 \\
             "{gpu_duration_us:.3f} |".format(**row)
         )
     copy_lines = [
-        "| {rank} | {kind} | {instances} | {bytes} | "
-        "{gpu_time_us:.3f} |".format(**row)
+        "| {rank} | {kind} | {instances} | {bytes} | {gpu_time_us:.3f} |".format(**row)
         for row in memcpy_summary
     ]
     projected_span_ms = summary["profiled_cycle"]["gpu_projected_span_ms"]

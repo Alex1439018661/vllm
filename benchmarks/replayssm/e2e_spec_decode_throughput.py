@@ -52,8 +52,9 @@ def parse_args():
     p = argparse.ArgumentParser(
         description="E2E spec-decode throughput: AR vs standard vs ReplaySSM."
     )
-    p.add_argument("--model-id",
-                   default="nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4")
+    p.add_argument(
+        "--model-id", default="nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4"
+    )
     p.add_argument("--tensor-parallel-size", type=int, default=1)
     p.add_argument(
         "--enable-expert-parallel",
@@ -62,17 +63,25 @@ def parse_args():
     )
     p.add_argument("--all2all-backend", default="allgather_reducescatter")
     p.add_argument("--batch-size", type=int, default=512)
-    p.add_argument("--num-spec", type=int, default=3,
-                   help="Draft tokens per step (spec window = num_spec + 1).")
+    p.add_argument(
+        "--num-spec",
+        type=int,
+        default=3,
+        help="Draft tokens per step (spec window = num_spec + 1).",
+    )
     p.add_argument("--spec-method", default="mtp")
     p.add_argument(
         "--spec-model",
         default=None,
         help="Optional external draft checkpoint, required by DSpark heads that "
-             "are not embedded in the target checkpoint.",
+        "are not embedded in the target checkpoint.",
     )
-    p.add_argument("--buffer-len", type=int, default=16,
-                   help="ReplaySSM history length (>= 1 + num_spec).")
+    p.add_argument(
+        "--buffer-len",
+        type=int,
+        default=16,
+        help="ReplaySSM history length (>= 1 + num_spec).",
+    )
     p.add_argument("--max-tokens", type=int, default=256)
     p.add_argument("--max-model-len", type=int, default=2048)
     p.add_argument("--dtype", default="auto")
@@ -89,25 +98,45 @@ def parse_args():
         help="Optional local GSM8K JSONL file; defaults to openai/gsm8k.",
     )
     p.add_argument("--gpu-memory-utilization", type=float, default=0.9)
-    p.add_argument("--warmup-s", type=float, default=30.0,
-                   help="Sustained full-batch decode before timing, to ramp the "
-                        "GPU SM clock to its steady-state boost.")
-    p.add_argument("--enable-thinking", action="store_true",
-                   help="Keep reasoning mode on (default off for short outputs).")
-    p.add_argument("--disable-flashinfer-autotune",
-                   action=argparse.BooleanOptionalAction, default=True,
-                   help="Disable the FlashInfer FP4-MoE autotuner (default: on). "
-                        "It is unstable under CUDA-graph capture on the "
-                        "pre-release Blackwell FP4 path; pass "
-                        "--no-disable-flashinfer-autotune for non-FP4 models.")
-    p.add_argument("--modes", default="ar,standard,cache",
-                   help="Comma-separated subset of {ar,standard,cache}.")
-    p.add_argument("--moe-backend", default=None,
-                   help="Override the draft-model MoE backend (e.g. triton). On "
-                        "Blackwell the draft's bf16 MoE hangs on flashinfer_trtllm; "
-                        "pass triton. Main-model MoE is left at auto.")
-    p.add_argument("--worker", choices=["ar", "standard", "cache"], default=None,
-                   help=argparse.SUPPRESS)
+    p.add_argument(
+        "--warmup-s",
+        type=float,
+        default=30.0,
+        help="Sustained full-batch decode before timing, to ramp the "
+        "GPU SM clock to its steady-state boost.",
+    )
+    p.add_argument(
+        "--enable-thinking",
+        action="store_true",
+        help="Keep reasoning mode on (default off for short outputs).",
+    )
+    p.add_argument(
+        "--disable-flashinfer-autotune",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Disable the FlashInfer FP4-MoE autotuner (default: on). "
+        "It is unstable under CUDA-graph capture on the "
+        "pre-release Blackwell FP4 path; pass "
+        "--no-disable-flashinfer-autotune for non-FP4 models.",
+    )
+    p.add_argument(
+        "--modes",
+        default="ar,standard,cache",
+        help="Comma-separated subset of {ar,standard,cache}.",
+    )
+    p.add_argument(
+        "--moe-backend",
+        default=None,
+        help="Override the draft-model MoE backend (e.g. triton). On "
+        "Blackwell the draft's bf16 MoE hangs on flashinfer_trtllm; "
+        "pass triton. Main-model MoE is left at auto.",
+    )
+    p.add_argument(
+        "--worker",
+        choices=["ar", "standard", "cache"],
+        default=None,
+        help=argparse.SUPPRESS,
+    )
     return p.parse_args()
 
 
@@ -115,9 +144,7 @@ def gsm8k_messages(batch_size, dataset_path=None):
     if dataset_path:
         with open(dataset_path, encoding="utf-8") as dataset_file:
             questions = [
-                json.loads(line)["question"]
-                for line in dataset_file
-                if line.strip()
+                json.loads(line)["question"] for line in dataset_file if line.strip()
             ]
     else:
         from datasets import load_dataset
@@ -128,13 +155,16 @@ def gsm8k_messages(batch_size, dataset_path=None):
         ]
     if not questions:
         raise ValueError("GSM8K dataset contains no questions")
-    return [[{"role": "user", "content": questions[i % len(questions)]}]
-            for i in range(batch_size)]
+    return [
+        [{"role": "user", "content": questions[i % len(questions)]}]
+        for i in range(batch_size)
+    ]
 
 
 def _sum_counter(metrics, name):
     return sum(
-        m.value for m in metrics
+        m.value
+        for m in metrics
         if getattr(m, "name", None) == name and hasattr(m, "value")
     )
 
@@ -171,11 +201,28 @@ def run_worker(args):
         # <= max_concurrency sub-batches when bs > cap, and fixes the
         # bs=1,T=6 "cudagraph size must be a multiple of T" abort.
         compilation_config={
-            "cudagraph_capture_sizes": sorted({
-                min(r, args.batch_size) * spec_window
-                for r in (1, 2, 4, 8, 16, 24, 32, 48, 64, 96, 128,
-                          192, 256, 384, 512)
-            }),
+            "cudagraph_capture_sizes": sorted(
+                {
+                    min(r, args.batch_size) * spec_window
+                    for r in (
+                        1,
+                        2,
+                        4,
+                        8,
+                        16,
+                        24,
+                        32,
+                        48,
+                        64,
+                        96,
+                        128,
+                        192,
+                        256,
+                        384,
+                        512,
+                    )
+                }
+            ),
             "max_cudagraph_capture_size": args.batch_size * spec_window,
         },
     )
@@ -201,15 +248,15 @@ def run_worker(args):
     llm = LLM(**llm_kwargs)
     messages = gsm8k_messages(args.batch_size, args.dataset_path)
     chat_kwargs = {"enable_thinking": args.enable_thinking}
-    sp = SamplingParams(n=1, temperature=0.0, max_tokens=args.max_tokens,
-                        ignore_eos=True, seed=0)
+    sp = SamplingParams(
+        n=1, temperature=0.0, max_tokens=args.max_tokens, ignore_eos=True, seed=0
+    )
 
     def timed_chat():
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         t0 = time.perf_counter()
-        outs = llm.chat(messages, sp, chat_template_kwargs=chat_kwargs,
-                        use_tqdm=False)
-        torch.cuda.synchronize()
+        outs = llm.chat(messages, sp, chat_template_kwargs=chat_kwargs, use_tqdm=False)
+        torch.accelerator.synchronize()
         return time.perf_counter() - t0, outs
 
     deadline = time.perf_counter() + args.warmup_s
@@ -226,33 +273,63 @@ def run_worker(args):
 
     accept_len = None
     if mode != "ar":
-        drafts = _sum_counter(llm.get_metrics(),
-                              "vllm:spec_decode_num_drafts") - pre_dft
-        accepted = _sum_counter(llm.get_metrics(),
-                                "vllm:spec_decode_num_accepted_tokens") - pre_acc
+        drafts = (
+            _sum_counter(llm.get_metrics(), "vllm:spec_decode_num_drafts") - pre_dft
+        )
+        accepted = (
+            _sum_counter(llm.get_metrics(), "vllm:spec_decode_num_accepted_tokens")
+            - pre_acc
+        )
         accept_len = 1.0 + accepted / drafts if drafts else None
 
-    result = {"mode": mode, "elapsed_s": elapsed, "tok_s": tok_s,
-              "accept_len": accept_len}
-    print(f"[{mode}] {elapsed:.2f}s  {tok_s:,.0f} tok/s"
-          + (f"  accept_len={accept_len:.2f}" if accept_len else ""), flush=True)
+    result = {
+        "mode": mode,
+        "elapsed_s": elapsed,
+        "tok_s": tok_s,
+        "accept_len": accept_len,
+    }
+    print(
+        f"[{mode}] {elapsed:.2f}s  {tok_s:,.0f} tok/s"
+        + (f"  accept_len={accept_len:.2f}" if accept_len else ""),
+        flush=True,
+    )
     print("RESULT_JSON " + json.dumps(result), flush=True)
 
 
 def run_one_mode(args, mode):
     cmd = [
-        sys.executable, __file__, "--worker", mode,
-        "--model-id", args.model_id,
-        "--tensor-parallel-size", str(args.tensor_parallel_size),
-        "--all2all-backend", args.all2all_backend,
-        "--batch-size", str(args.batch_size), "--num-spec", str(args.num_spec),
-        "--spec-method", args.spec_method, "--buffer-len", str(args.buffer_len),
-        "--max-tokens", str(args.max_tokens),
-        "--max-model-len", str(args.max_model_len), "--dtype", args.dtype,
-        "--kv-cache-dtype", args.kv_cache_dtype,
-        "--mamba-ssm-cache-dtype", args.mamba_ssm_cache_dtype,
-        "--gpu-memory-utilization", str(args.gpu_memory_utilization),
-        "--warmup-s", str(args.warmup_s),
+        sys.executable,
+        __file__,
+        "--worker",
+        mode,
+        "--model-id",
+        args.model_id,
+        "--tensor-parallel-size",
+        str(args.tensor_parallel_size),
+        "--all2all-backend",
+        args.all2all_backend,
+        "--batch-size",
+        str(args.batch_size),
+        "--num-spec",
+        str(args.num_spec),
+        "--spec-method",
+        args.spec_method,
+        "--buffer-len",
+        str(args.buffer_len),
+        "--max-tokens",
+        str(args.max_tokens),
+        "--max-model-len",
+        str(args.max_model_len),
+        "--dtype",
+        args.dtype,
+        "--kv-cache-dtype",
+        args.kv_cache_dtype,
+        "--mamba-ssm-cache-dtype",
+        args.mamba_ssm_cache_dtype,
+        "--gpu-memory-utilization",
+        str(args.gpu_memory_utilization),
+        "--warmup-s",
+        str(args.warmup_s),
     ]
     if args.spec_model:
         cmd += ["--spec-model", args.spec_model]
@@ -266,12 +343,15 @@ def run_one_mode(args, mode):
         cmd.append("--enable-thinking")
     if args.moe_backend:
         cmd += ["--moe-backend", args.moe_backend]
-    cmd.append("--disable-flashinfer-autotune" if args.disable_flashinfer_autotune
-               else "--no-disable-flashinfer-autotune")
+    cmd.append(
+        "--disable-flashinfer-autotune"
+        if args.disable_flashinfer_autotune
+        else "--no-disable-flashinfer-autotune"
+    )
 
     result = None
     child_env = os.environ.copy()
-    python_bin = str(Path(sys.executable).resolve().parent)
+    python_bin = str(Path(sys.executable).absolute().parent)
     child_env["PATH"] = os.pathsep.join(
         path for path in (python_bin, child_env.get("PATH")) if path
     )
@@ -287,7 +367,7 @@ def run_one_mode(args, mode):
         sys.stdout.write(line)
         sys.stdout.flush()
         if line.startswith("RESULT_JSON "):
-            result = json.loads(line[len("RESULT_JSON "):])
+            result = json.loads(line[len("RESULT_JSON ") :])
     proc.wait()
     if proc.returncode != 0:
         raise RuntimeError(f"mode '{mode}' worker exited with {proc.returncode}")
@@ -302,12 +382,14 @@ def main():
         run_worker(args)
         return
 
-    print(f"model={args.model_id}  draft={args.spec_model}  "
-          f"tp={args.tensor_parallel_size}  "
-          f"ep={args.enable_expert_parallel}  "
-          f"all2all={args.all2all_backend}  batch_size={args.batch_size}  "
-          f"num_spec={args.num_spec}  "
-          f"buffer_len={args.buffer_len}  max_tokens={args.max_tokens}")
+    print(
+        f"model={args.model_id}  draft={args.spec_model}  "
+        f"tp={args.tensor_parallel_size}  "
+        f"ep={args.enable_expert_parallel}  "
+        f"all2all={args.all2all_backend}  batch_size={args.batch_size}  "
+        f"num_spec={args.num_spec}  "
+        f"buffer_len={args.buffer_len}  max_tokens={args.max_tokens}"
+    )
 
     modes = [m for m in args.modes.split(",") if m]
     results = {m: run_one_mode(args, m) for m in modes}
@@ -322,11 +404,15 @@ def main():
         print(f"{MODE_LABEL[m]:<16}{r['tok_s']:>14,.0f}{al:>12}{r['elapsed_s']:>12.2f}")
     print("-" * len(header))
     if "cache" in results and "standard" in results:
-        print(f"ReplaySSM / standard : "
-              f"{results['cache']['tok_s'] / results['standard']['tok_s']:.2f}x")
+        print(
+            f"ReplaySSM / standard : "
+            f"{results['cache']['tok_s'] / results['standard']['tok_s']:.2f}x"
+        )
     if "cache" in results and "ar" in results:
-        print(f"ReplaySSM / AR       : "
-              f"{results['cache']['tok_s'] / results['ar']['tok_s']:.2f}x")
+        print(
+            f"ReplaySSM / AR       : "
+            f"{results['cache']['tok_s'] / results['ar']['tok_s']:.2f}x"
+        )
     summary = {
         "model": args.model_id,
         "tensor_parallel_size": args.tensor_parallel_size,

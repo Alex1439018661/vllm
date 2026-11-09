@@ -15,12 +15,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-DEFAULT_MODEL = "/data1/fanya/Qwen/Qwen3.6-35B-A3B"
-DEFAULT_DATASET = "/home/fanya/replayssm_build_artifacts/gsm8k_test.jsonl"
-DEFAULT_OUTPUT_ROOT = (
-    "/home/fanya/replayssm_build_artifacts/"
-    "expert_routing_qwen36_ep2_20260812_target_only"
-)
+from replayssm_runtime.config import VLLM_ROOT, resolve_arguments, results_dir
+
 RUN_SPECS = (
     ("replayssm_ar_bs128", "ar", 128),
     ("replayssm_spec_bs128_d3", "spec", 128),
@@ -59,9 +55,9 @@ def load_questions(dataset_path: Path, count: int) -> list[str]:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", choices=("run", "worker", "analyze"))
-    parser.add_argument("--model", default=DEFAULT_MODEL)
-    parser.add_argument("--dataset", default=DEFAULT_DATASET)
-    parser.add_argument("--output-root", default=DEFAULT_OUTPUT_ROOT)
+    parser.add_argument("--model")
+    parser.add_argument("--dataset")
+    parser.add_argument("--output-root")
     parser.add_argument("--max-tokens", type=int, default=256)
     parser.add_argument("--max-model-len", type=int, default=2048)
     parser.add_argument("--max-num-batched-tokens", type=int, default=2048)
@@ -72,7 +68,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--run-name", choices=tuple(spec[0] for spec in RUN_SPECS))
     parser.add_argument("--mode", choices=("ar", "spec"))
     parser.add_argument("--batch-size", type=int)
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.output_root is None:
+        if args.command != "run":
+            parser.error("--output-root is required for worker/analyze")
+        args.output_root = str(
+            results_dir() / f"expert_routing_{datetime.now(UTC):%Y%m%d_%H%M%S}"
+        )
+    if args.command != "analyze":
+        resolve_arguments(
+            parser,
+            args,
+            models=(("model", "qwen36"),),
+            datasets=(("dataset", "gsm8k"),),
+        )
+    return args
 
 
 def preflight(args: argparse.Namespace) -> dict[str, Any]:
@@ -101,7 +111,7 @@ def preflight(args: argparse.Namespace) -> dict[str, Any]:
         text=True,
     )
     commit = subprocess.run(
-        ["git", "rev-parse", "HEAD"],
+        ["git", "-C", str(VLLM_ROOT), "rev-parse", "HEAD"],
         check=True,
         capture_output=True,
         text=True,
@@ -392,7 +402,7 @@ def run_worker(args: argparse.Namespace) -> None:
             ignore_eos=True,
             seed=0,
         )
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         start = time.perf_counter()
         outputs = llm.chat(
             messages,
@@ -400,7 +410,7 @@ def run_worker(args: argparse.Namespace) -> None:
             chat_template_kwargs={"enable_thinking": False},
             use_tqdm=True,
         )
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         elapsed = time.perf_counter() - start
         if len(outputs) != args.batch_size:
             raise AssertionError(

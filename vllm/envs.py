@@ -557,6 +557,11 @@ def _resolve_rust_frontend_path() -> str | None:
 
 
 environment_variables: dict[str, Callable[[], Any]] = {
+    "VLLM_VERIFY_DIAG_DIR": lambda: os.getenv("VLLM_VERIFY_DIAG_DIR", ""),
+    "VLLM_VERIFY_DIAG_MAX_STEPS": lambda: int(
+        os.getenv("VLLM_VERIFY_DIAG_MAX_STEPS", "1024")
+    ),
+    "VLLM_VERIFY_DIAG_TOKEN_CAP": lambda: os.getenv("VLLM_VERIFY_DIAG_TOKEN_CAP"),
     # ================== Installation Time Env Vars ==================
     # Target device of vLLM, supporting [cuda (by default),
     # rocm, cpu]
@@ -2129,6 +2134,10 @@ def compile_factors() -> dict[str, object]:
             )
             continue
 
+        # Instrumented and ordinary graphs differ, but their output paths do not
+        # affect generated code. Reuse the diagnostic cache across result dirs.
+        if factor == "VLLM_VERIFY_DIAG_DIR":
+            raw = bool(raw)
         factors[factor] = normalize_value(raw)
 
     ray_noset_env_vars = [

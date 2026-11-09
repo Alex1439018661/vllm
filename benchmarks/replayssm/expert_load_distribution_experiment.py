@@ -11,28 +11,20 @@ import json
 import math
 import os
 import platform
-import re
 import shutil
 import subprocess
 import sys
 from collections import Counter, defaultdict
+from collections.abc import Iterable
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 import numpy as np
+import regex as re
+from replayssm_runtime.config import VLLM_ROOT, resolve_arguments, results_dir
 
-DEFAULT_QWEN_MODEL = "/data1/fanya/Qwen/Qwen3.6-35B-A3B"
-DEFAULT_GEMMA_MODEL = (
-    "/home/fanya/data1/fanya/models/gemma-4-26B-A4B-it"
-)
-DEFAULT_GEMMA_DRAFTER = (
-    "/home/fanya/data1/fanya/models/"
-    "gemma-4-26B-A4B-it-speculator.eagle3"
-)
-DEFAULT_DATASET = "/home/fanya/replayssm_build_artifacts/gsm8k_test.jsonl"
-DEFAULT_OUTPUT_PARENT = "/home/fanya/replayssm_build_artifacts"
 SAMPLE_COUNT = 64
 DP_SIZE = 2
 TOP_K = 8
@@ -191,9 +183,7 @@ def build_sample_manifest(
     rows = load_dataset(dataset_path)
     if len(rows) < count:
         raise ValueError(f"dataset has {len(rows)} rows, expected at least {count}")
-    selected = np.random.default_rng(seed).choice(
-        len(rows), size=count, replace=False
-    )
+    selected = np.random.default_rng(seed).choice(len(rows), size=count, replace=False)
     samples = []
     for sample_id, source_index_value in enumerate(selected.tolist()):
         source_index = int(source_index_value)
@@ -365,9 +355,7 @@ def validate_rank_artifacts(
         "tensor_parallel_size": 1,
         "data_parallel_size": DP_SIZE,
         "expert_parallel_size": DP_SIZE,
-        "num_speculative_tokens": (
-            contract.draft_length if mode == "spec" else 0
-        ),
+        "num_speculative_tokens": (contract.draft_length if mode == "spec" else 0),
         "max_num_seqs": (
             contract.spec_batch_size if mode == "spec" else contract.ar_batch_size
         )
@@ -386,8 +374,7 @@ def validate_rank_artifacts(
     expected_output_count = contract.sample_count // DP_SIZE
     if len(outputs) != expected_output_count:
         raise AssertionError(
-            f"rank {rank} has {len(outputs)} outputs, "
-            f"expected {expected_output_count}"
+            f"rank {rank} has {len(outputs)} outputs, expected {expected_output_count}"
         )
     if any(len(output["token_ids"]) != MAX_TOKENS for output in outputs):
         raise AssertionError(f"rank {rank} does not have exactly 64 output tokens")
@@ -535,8 +522,10 @@ def preflight(args: argparse.Namespace, output_root: Path) -> dict[str, Any]:
     gpu_lines = run_command(
         [
             "nvidia-smi",
-            "--query-gpu=index,name,pci.bus_id,memory.total,memory.used,"
-            "utilization.gpu",
+            (
+                "--query-gpu=index,name,pci.bus_id,memory.total,memory.used,"
+                "utilization.gpu"
+            ),
             "--format=csv,noheader",
         ]
     ).splitlines()
@@ -552,9 +541,13 @@ def preflight(args: argparse.Namespace, output_root: Path) -> dict[str, Any]:
 
     return {
         "timestamp": utc_now(),
-        "git_branch": run_command(["git", "branch", "--show-current"]),
-        "git_commit": run_command(["git", "rev-parse", "HEAD"]),
-        "git_status_short": run_command(["git", "status", "--short"]),
+        "git_branch": run_command(
+            ["git", "-C", str(VLLM_ROOT), "branch", "--show-current"]
+        ),
+        "git_commit": run_command(["git", "-C", str(VLLM_ROOT), "rev-parse", "HEAD"]),
+        "git_status_short": run_command(
+            ["git", "-C", str(VLLM_ROOT), "status", "--short"]
+        ),
         "python": sys.version,
         "python_executable": str(Path(sys.executable).resolve()),
         "vllm_import_path": str(Path(vllm.__file__).resolve()),
@@ -622,9 +615,7 @@ def dry_validate_configs(
                     "tensor_parallel_size": (
                         config.parallel_config.tensor_parallel_size
                     ),
-                    "data_parallel_size": (
-                        config.parallel_config.data_parallel_size
-                    ),
+                    "data_parallel_size": (config.parallel_config.data_parallel_size),
                     "expert_parallel_size": (
                         config.parallel_config.world_size
                         if config.parallel_config.enable_expert_parallel
@@ -654,7 +645,7 @@ def run_all(args: argparse.Namespace) -> None:
         output_root = Path(args.output_root).expanduser().resolve()
     else:
         output_root = (
-            Path(DEFAULT_OUTPUT_PARENT)
+            results_dir()
             / f"expert_load_distribution_{contract.name}_{timestamp_slug()}"
         )
     if output_root.exists() and not args.resume:
@@ -695,8 +686,7 @@ def run_all(args: argparse.Namespace) -> None:
             "output_root": str(output_root),
             "sample_manifest": str(sample_manifest_path),
             "cells": [
-                {"model_family": family, "mode": mode}
-                for family, mode in cell_names()
+                {"model_family": family, "mode": mode} for family, mode in cell_names()
             ],
         }
         write_json(run_manifest_path, manifest)
@@ -761,9 +751,7 @@ def run_all(args: argparse.Namespace) -> None:
                         "validation": validation,
                     }
                 )
-                write_json(
-                    attempt_dir / "attempt_manifest.json", attempt_manifest
-                )
+                write_json(attempt_dir / "attempt_manifest.json", attempt_manifest)
                 status["cells"][cell_key].update(
                     {
                         "state": "complete",
@@ -782,9 +770,7 @@ def run_all(args: argparse.Namespace) -> None:
                 }
                 write_json(attempt_dir / "failure.json", failure)
                 attempt_manifest.update(failure)
-                write_json(
-                    attempt_dir / "attempt_manifest.json", attempt_manifest
-                )
+                write_json(attempt_dir / "attempt_manifest.json", attempt_manifest)
                 status["cells"][cell_key].update(failure)
                 write_json(status_path, status)
                 raise
@@ -915,8 +901,7 @@ def run_worker(args: argparse.Namespace) -> None:
     expected_samples = contract.sample_count // DP_SIZE
     if len(samples) != expected_samples:
         raise AssertionError(
-            f"rank {rank} received {len(samples)} samples, "
-            f"expected {expected_samples}"
+            f"rank {rank} received {len(samples)} samples, expected {expected_samples}"
         )
     os.environ.setdefault("VLLM_LOGGING_LEVEL", "INFO")
     os.environ.setdefault("VLLM_USE_FLASHINFER_SAMPLER", "0")
@@ -942,9 +927,7 @@ def run_worker(args: argparse.Namespace) -> None:
             },
         )
         llm = LLM(**llm_kwargs)
-        configured_rank = (
-            llm.llm_engine.vllm_config.parallel_config.data_parallel_rank
-        )
+        configured_rank = llm.llm_engine.vllm_config.parallel_config.data_parallel_rank
         if configured_rank != rank:
             raise AssertionError(
                 f"vLLM configured DP rank {configured_rank}, torch rank is {rank}"
@@ -958,8 +941,7 @@ def run_worker(args: argparse.Namespace) -> None:
             seed=0,
         )
         messages = [
-            [{"role": "user", "content": str(sample["question"])}]
-            for sample in samples
+            [{"role": "user", "content": str(sample["question"])}] for sample in samples
         ]
         outputs = llm.chat(
             messages,
@@ -969,8 +951,7 @@ def run_worker(args: argparse.Namespace) -> None:
         )
         if len(outputs) != len(samples):
             raise AssertionError(
-                f"rank {rank} produced {len(outputs)} outputs, "
-                f"expected {len(samples)}"
+                f"rank {rank} produced {len(outputs)} outputs, expected {len(samples)}"
             )
         with (output_dir / "outputs.jsonl").open("x", encoding="utf-8") as file:
             for sample, output in zip(samples, outputs, strict=True):
@@ -985,9 +966,7 @@ def run_worker(args: argparse.Namespace) -> None:
                     json.dumps(
                         {
                             "sample_id": int(sample["sample_id"]),
-                            "source_line_number": int(
-                                sample["source_line_number"]
-                            ),
+                            "source_line_number": int(sample["source_line_number"]),
                             "question_sha256": sample["question_sha256"],
                             "request_id": output.request_id,
                             "prompt_token_count": len(prompt_token_ids),
@@ -1120,21 +1099,16 @@ def validate_step(
     if mode == "spec":
         stages = spec_stages(contract.draft_length)
         expected_rank_rows = contract.target_rows_per_step // DP_SIZE
-        expected_rank_counts = Counter(
-            {0: expected_rank_rows, 1: expected_rank_rows}
-        )
+        expected_rank_counts = Counter({0: expected_rank_rows, 1: expected_rank_rows})
         if rank_counts != expected_rank_counts:
             reasons.append(
                 f"rank row counts are {dict(rank_counts)}, expected "
                 f"{expected_rank_rows} each"
             )
-        expected_kinds = Counter(
-            {stage: contract.spec_batch_size for stage in stages}
-        )
+        expected_kinds = Counter({stage: contract.spec_batch_size for stage in stages})
         if kinds != expected_kinds:
             reasons.append(
-                f"stage counts are {dict(kinds)}, expected "
-                f"{dict(expected_kinds)}"
+                f"stage counts are {dict(kinds)}, expected {dict(expected_kinds)}"
             )
         if len(requests) != contract.spec_batch_size:
             reasons.append(
@@ -1150,14 +1124,10 @@ def validate_step(
             if request_kinds != set(stages):
                 reasons.append(f"request {request} does not contain all spec stages")
                 break
-        position_rows = [
-            row for row in rows if row["route_kind"] == "spec_target"
-        ]
+        position_rows = [row for row in rows if row["route_kind"] == "spec_target"]
     else:
         expected_rank_rows = contract.ar_batch_size // DP_SIZE
-        expected_rank_counts = Counter(
-            {0: expected_rank_rows, 1: expected_rank_rows}
-        )
+        expected_rank_counts = Counter({0: expected_rank_rows, 1: expected_rank_rows})
         if rank_counts != expected_rank_counts:
             reasons.append(
                 f"rank row counts are {dict(rank_counts)}, expected "
@@ -1225,9 +1195,7 @@ def validate_step(
                         for row in draft_rows
                         if row["route_kind"] == stage
                     ),
-                    "total": sum(
-                        row["route_kind"] == stage for row in draft_rows
-                    ),
+                    "total": sum(row["route_kind"] == stage for row in draft_rows),
                 }
                 for stage in spec_stages(contract.draft_length)[1:]
             },
@@ -1258,9 +1226,7 @@ def choose_distinct_steps(
         )
         chosen = dict(chosen)
         chosen["selection_target"] = target
-        chosen["selection_distance"] = abs(
-            float(chosen["position"]["median"]) - target
-        )
+        chosen["selection_distance"] = abs(float(chosen["position"]["median"]) - target)
         selected.append(chosen)
         used.add(int(chosen["scheduler_step"]))
     return selected[0], selected[1]
@@ -1286,8 +1252,10 @@ def gini(values: np.ndarray) -> float:
     sorted_values = np.sort(values)
     indices = np.arange(1, values.size + 1, dtype=np.float64)
     return float(
-        (2 * np.sum(indices * sorted_values) / np.sum(sorted_values)
-         - (values.size + 1))
+        (
+            2 * np.sum(indices * sorted_values) / np.sum(sorted_values)
+            - (values.size + 1)
+        )
         / values.size
     )
 
@@ -1331,15 +1299,12 @@ def compare_outputs(
         range(sample_count)
     ):
         raise AssertionError(
-            "output consistency requires exactly sample IDs "
-            f"0..{sample_count - 1}"
+            f"output consistency requires exactly sample IDs 0..{sample_count - 1}"
         )
     comparisons = []
     for sample_id in range(sample_count):
         ar_tokens = [int(value) for value in ar_by_sample[sample_id]["token_ids"]]
-        spec_tokens = [
-            int(value) for value in spec_by_sample[sample_id]["token_ids"]
-        ]
+        spec_tokens = [int(value) for value in spec_by_sample[sample_id]["token_ids"]]
         prefix = 0
         while (
             prefix < len(ar_tokens)
@@ -1478,9 +1443,7 @@ def analyze_model(
         float(spec_early["position"]["median"]),
         float(spec_late["position"]["median"]),
     )
-    ar_early, ar_late = choose_distinct_steps(
-        candidates_by_mode["ar"], ar_targets
-    )
+    ar_early, ar_late = choose_distinct_steps(candidates_by_mode["ar"], ar_targets)
     selected = {
         "early": {"spec": spec_early, "ar": ar_early},
         "late": {"spec": spec_late, "ar": ar_late},
@@ -1530,9 +1493,7 @@ def analyze_model(
                             "model": model.key,
                             "representative_step": label,
                             "mode": mode,
-                            "scheduler_step": int(
-                                step_summary["scheduler_step"]
-                            ),
+                            "scheduler_step": int(step_summary["scheduler_step"]),
                             "position_min": step_summary["position"]["min"],
                             "position_median": step_summary["position"]["median"],
                             "position_max": step_summary["position"]["max"],
@@ -1547,8 +1508,7 @@ def analyze_model(
                 owner_totals = [
                     int(
                         counts[
-                            owner * experts_per_owner : (owner + 1)
-                            * experts_per_owner
+                            owner * experts_per_owner : (owner + 1) * experts_per_owner
                         ].sum()
                     )
                     for owner in range(owners)
@@ -1588,19 +1548,11 @@ def analyze_model(
         "artifacts": {
             "png": str(analysis_dir / f"{model.key}_expert_load_composite.png"),
             "pdf": str(analysis_dir / f"{model.key}_expert_load_composite.pdf"),
-            "selected_step_loads": str(
-                analysis_dir / "selected_step_loads.csv"
-            ),
+            "selected_step_loads": str(analysis_dir / "selected_step_loads.csv"),
             "selected_steps": str(analysis_dir / "selected_steps.json"),
-            "imbalance_summary_csv": str(
-                analysis_dir / "imbalance_summary.csv"
-            ),
-            "imbalance_summary_json": str(
-                analysis_dir / "imbalance_summary.json"
-            ),
-            "output_consistency": str(
-                analysis_dir / "output_consistency.json"
-            ),
+            "imbalance_summary_csv": str(analysis_dir / "imbalance_summary.csv"),
+            "imbalance_summary_json": str(analysis_dir / "imbalance_summary.json"),
+            "output_consistency": str(analysis_dir / "output_consistency.json"),
         },
     }
 
@@ -1643,9 +1595,9 @@ def analyze_command(args: argparse.Namespace) -> None:
 
 
 def add_shared_arguments(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--qwen-model", default=DEFAULT_QWEN_MODEL)
-    parser.add_argument("--gemma-model", default=DEFAULT_GEMMA_MODEL)
-    parser.add_argument("--gemma-drafter", default=DEFAULT_GEMMA_DRAFTER)
+    parser.add_argument("--qwen-model")
+    parser.add_argument("--gemma-model")
+    parser.add_argument("--gemma-drafter")
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
     parser.add_argument(
         "--spec-batch-size",
@@ -1670,7 +1622,7 @@ def parse_args() -> argparse.Namespace:
     subparsers = parser.add_subparsers(dest="command", required=True)
     run_parser = subparsers.add_parser("run")
     add_shared_arguments(run_parser)
-    run_parser.add_argument("--dataset", default=DEFAULT_DATASET)
+    run_parser.add_argument("--dataset")
     run_parser.add_argument("--output-root")
     run_parser.add_argument("--resume", action="store_true")
     worker_parser = subparsers.add_parser("worker")
@@ -1684,7 +1636,18 @@ def parse_args() -> argparse.Namespace:
     analyze_parser = subparsers.add_parser("analyze")
     add_shared_arguments(analyze_parser)
     analyze_parser.add_argument("--output-root", required=True)
-    return parser.parse_args()
+    args = parser.parse_args()
+    models = (
+        ("qwen_model", "qwen36"),
+        ("gemma_model", "gemma4"),
+        ("gemma_drafter", "gemma4_eagle3"),
+    )
+    if args.command == "run":
+        resolve_arguments(parser, args, models=models, datasets=(("dataset", "gsm8k"),))
+    elif args.command == "worker":
+        selected = models[:1] if args.model_family == "qwen36" else models[1:]
+        resolve_arguments(parser, args, models=selected)
+    return args
 
 
 def main() -> None:

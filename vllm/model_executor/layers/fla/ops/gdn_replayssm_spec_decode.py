@@ -8,6 +8,12 @@ import torch
 
 from vllm.model_executor.layers.mamba.ops.replayssm_config import get_replayssm_config
 from vllm.triton_utils import tl, triton
+from vllm.verify_diagnostics import (
+    active as active_verify_diag,
+)
+from vllm.verify_diagnostics import (
+    region as verify_diag_region,
+)
 
 
 @triton.jit
@@ -812,22 +818,23 @@ def commit_gdn_replayssm_spec(
         cache_buf_len = triton.next_power_of_2(max_cache_len)
     n_rows = state_batch_indices.shape[0]
     BLOCK = triton.next_power_of_2(max(1, n_rows))
-    _advance_gdn_spec_cursors_kernel[(1,)](
-        write_pos,
-        cache_base,
-        is_flush,
-        num_accepted,
-        state_batch_indices,
-        n_rows,
-        stride_sbi=state_batch_indices.stride(0),
-        stride_na=num_accepted.stride(0),
-        MAX_CACHE_LEN=max_cache_len,
-        MAX_SPEC_LEN=max_spec_len,
-        CACHE_BUF_LEN=cache_buf_len,
-        FLUSH_INTERVAL=flush_interval or 0,
-        BLOCK=BLOCK,
-        NULL_BLOCK_ID=null_block_id,
-    )
+    with verify_diag_region(active_verify_diag(), "replayssm_commit_previous"):
+        _advance_gdn_spec_cursors_kernel[(1,)](
+            write_pos,
+            cache_base,
+            is_flush,
+            num_accepted,
+            state_batch_indices,
+            n_rows,
+            stride_sbi=state_batch_indices.stride(0),
+            stride_na=num_accepted.stride(0),
+            MAX_CACHE_LEN=max_cache_len,
+            MAX_SPEC_LEN=max_spec_len,
+            CACHE_BUF_LEN=cache_buf_len,
+            FLUSH_INTERVAL=flush_interval or 0,
+            BLOCK=BLOCK,
+            NULL_BLOCK_ID=null_block_id,
+        )
 
 
 def reset_gdn_replayssm_spec_cursors(

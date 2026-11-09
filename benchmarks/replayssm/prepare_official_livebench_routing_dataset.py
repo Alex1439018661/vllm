@@ -11,8 +11,9 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 CATEGORIES = (
     "coding",
@@ -33,12 +34,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rows", type=int, default=512)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--page-size", type=int, default=100)
-    parser.add_argument(
-        "--model", default="/data1/fanya/Qwen/Qwen3.6-35B-A3B"
-    )
+    parser.add_argument("--model")
     parser.add_argument("--max-prompt-tokens", type=int, default=1700)
     parser.add_argument("--livebench-repo-commit", required=True)
-    return parser.parse_args()
+    from replayssm_runtime.config import resolve_arguments
+
+    args = parser.parse_args()
+    return resolve_arguments(parser, args, models=(("model", "qwen36"),))
 
 
 def get_json(url: str) -> dict[str, Any]:
@@ -100,11 +102,7 @@ def select_rows(
     eligible = []
     for row in rows:
         turns = row.get("turns", [])
-        if (
-            len(turns) != 1
-            or not isinstance(turns[0], str)
-            or not turns[0].strip()
-        ):
+        if len(turns) != 1 or not isinstance(turns[0], str) or not turns[0].strip():
             continue
         prompt_tokens = prompt_token_count(turns[0])
         if prompt_tokens <= max_prompt_tokens:
@@ -185,9 +183,9 @@ def main() -> None:
                     "category": category,
                     "task": source["task"],
                     "question_id": source["question_id"],
-                    "livebench_release_date": str(
-                        source["livebench_release_date"]
-                    )[:10],
+                    "livebench_release_date": str(source["livebench_release_date"])[
+                        :10
+                    ],
                     "livebench_removal_date": (
                         str(source["livebench_removal_date"])[:10]
                         if source.get("livebench_removal_date")

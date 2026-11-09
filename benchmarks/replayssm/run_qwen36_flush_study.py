@@ -11,6 +11,7 @@ import sys
 from pathlib import Path
 
 from qwen36_flush_crossover import save
+from replayssm_runtime.config import VLLM_ROOT
 
 
 def launch(args, command, destination, marker):
@@ -39,7 +40,7 @@ def launch(args, command, destination, marker):
             script_sha256=digest,
             source_archive=str(archive),
             runtime_diff=subprocess.check_output(
-                ["git", "diff", "--", "vllm"], text=True
+                ["git", "-C", str(VLLM_ROOT), "diff", "HEAD", "--"], text=True
             ),
         ),
     )

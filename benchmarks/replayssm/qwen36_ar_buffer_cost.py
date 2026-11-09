@@ -14,6 +14,7 @@ import torch
 from qwen36_ar_no_state_write import fused_recurrent_gated_delta_rule_replayssm
 from qwen36_flush_crossover import Inputs, capture, save
 from qwen36_state_cost import state_store
+from replayssm_runtime.config import VLLM_ROOT
 
 from vllm.model_executor.layers.fla.ops.fused_recurrent import (
     fused_recurrent_gated_delta_rule_packed_decode,
@@ -37,7 +38,7 @@ def benchmark(root):
         root / "environment.json",
         dict(
             source_head=subprocess.check_output(
-                ["git", "rev-parse", "HEAD"], text=True
+                ["git", "-C", str(VLLM_ROOT), "rev-parse", "HEAD"], text=True
             ).strip(),
             sources=sources,
             batch=[1, 4, 8, 16, 32],
