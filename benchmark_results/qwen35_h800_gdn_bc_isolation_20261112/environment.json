@@ -1,0 +1,6 @@
+{
+ "torch": "2.11.0+cu128",
+ "device": "NVIDIA H800 NVL",
+ "layers": 30,
+ "note": "verify launch only, cold state via 30 distinct layers"
+}
